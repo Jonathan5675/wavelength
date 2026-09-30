@@ -1,0 +1,125 @@
+name: Build Wavelength IPA v4
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-ios:
+    runs-on: macos-15
+
+    steps:
+      - name: Clone official Dev-Siri Wavelength source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch v1.2.3 https://github.com/Dev-Siri/wavelength.git source
+          cd source
+          echo "Wavelength commit: $(git rev-parse --short HEAD)"
+          echo "Wavelength ref: $(git describe --tags --always)"
+
+      - name: Recover production config from official Wavelength APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK_URL="https://github.com/Dev-Siri/wavelength/releases/download/v1.2.3/app-release.apk"
+          curl -fL --retry 3 --retry-delay 2 "$APK_URL" -o /tmp/wavelength.apk
+
+          ENV_PATH="$(unzip -Z1 /tmp/wavelength.apk | awk '/(^|\/)\.env$/ { print; exit }')"
+          if [[ -z "${ENV_PATH}" ]]; then
+            echo "::error::Could not find the bundled .env inside the official APK."
+            exit 1
+          fi
+
+          unzip -p /tmp/wavelength.apk "$ENV_PATH" > source/apps/mobile/.env
+
+          for key in API_GATEWAY_URL PLAYER_GATEWAY_URL WEB_GOOGLE_CLIENT_ID IOS_GOOGLE_CLIENT_ID; do
+            if ! grep -q "^${key}=" source/apps/mobile/.env; then
+              echo "::error::Required key ${key} is missing from the recovered .env."
+              exit 1
+            fi
+          done
+
+          echo "Recovered production runtime configuration."
+
+      - name: Install Flutter 3.41.0
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.41.0'
+          channel: stable
+          cache: true
+
+      - name: Verify Flutter and Xcode
+        shell: bash
+        run: |
+          set -euo pipefail
+          which flutter
+          flutter --version
+          dart --version
+          xcodebuild -version
+          flutter config --no-analytics || true
+
+      - name: Prepare Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustc --version
+          cargo --version
+          rustup target add aarch64-apple-ios
+
+      - name: Install CocoaPods if needed
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v pod >/dev/null 2>&1; then
+            sudo gem install cocoapods
+          fi
+          pod --version
+
+      - name: Get Flutter dependencies
+        working-directory: source/apps/mobile
+        shell: bash
+        run: |
+          set -euo pipefail
+          flutter pub get
+
+      - name: Build unsigned iOS app
+        working-directory: source/apps/mobile
+        shell: bash
+        run: |
+          set -euo pipefail
+          flutter build ios --release --no-codesign
+
+      - name: Package unsigned IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APP="source/apps/mobile/build/ios/iphoneos/Runner.app"
+          if [[ ! -d "$APP" ]]; then
+            echo "::error::Runner.app was not produced."
+            exit 1
+          fi
+
+          OUT="$RUNNER_TEMP/wavelength-ipa"
+          rm -rf "$OUT"
+          mkdir -p "$OUT/Payload"
+          ditto "$APP" "$OUT/Payload/Runner.app"
+
+          cd "$OUT"
+          /usr/bin/zip -qry Wavelength-unsigned.ipa Payload
+
+          test -s Wavelength-unsigned.ipa
+          ls -lh Wavelength-unsigned.ipa
+          echo "IPA_PATH=$OUT/Wavelength-unsigned.ipa" >> "$GITHUB_ENV"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Wavelength-iOS-unsigned
+          path: ${{ env.IPA_PATH }}
+          if-no-files-found: error
+          retention-days: 14
