@@ -1,0 +1,143 @@
+name: Build Wavelength unsigned IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Wavelength git ref to build"
+        required: true
+        default: "v1.2.3"
+
+permissions:
+  contents: read
+
+jobs:
+  build-ios:
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout Wavelength
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 1
+
+      # Wavelength bundles .env as a Flutter asset, but the source repo does not
+      # publish the production file. Recover the same runtime configuration from
+      # the project's official Android release rather than hard-coding it here.
+      - name: Recover Wavelength production config from official APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK_URL="https://github.com/Dev-Siri/wavelength/releases/download/v1.2.3/app-release.apk"
+          curl -fL --retry 3 --retry-delay 2 "$APK_URL" -o /tmp/wavelength.apk
+
+          ENV_PATH="$(unzip -Z1 /tmp/wavelength.apk | awk '/(^|\/)\.env$/ { print; exit }')"
+          if [[ -z "${ENV_PATH}" ]]; then
+            echo "::error::Could not find the bundled .env inside the official APK."
+            exit 1
+          fi
+
+          unzip -p /tmp/wavelength.apk "$ENV_PATH" > apps/mobile/.env
+
+          # Verify the release config contains the keys the current iOS source uses.
+          # Values are intentionally never printed to the Actions log.
+          for key in API_GATEWAY_URL PLAYER_GATEWAY_URL WEB_GOOGLE_CLIENT_ID IOS_GOOGLE_CLIENT_ID; do
+            if ! grep -q "^${key}=" apps/mobile/.env; then
+              echo "::error::Required key ${key} is missing from the recovered .env."
+              exit 1
+            fi
+          done
+
+          echo "Recovered production runtime configuration."
+
+      # Use the exact Flutter revision recorded by the Wavelength project instead
+      # of guessing a stable Flutter version.
+      - name: Install Wavelength's Flutter revision
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          FLUTTER_REV="$(awk -F'"' '/revision:/ { print $2; exit }' apps/mobile/.metadata)"
+          if [[ -z "${FLUTTER_REV}" ]]; then
+            echo "::error::Could not determine Flutter revision from apps/mobile/.metadata."
+            exit 1
+          fi
+
+          mkdir -p "$HOME/flutter"
+          git -C "$HOME/flutter" init
+          git -C "$HOME/flutter" remote add origin https://github.com/flutter/flutter.git
+          git -C "$HOME/flutter" fetch --depth=1 origin "$FLUTTER_REV"
+          git -C "$HOME/flutter" checkout --detach FETCH_HEAD
+
+          echo "$HOME/flutter/bin" >> "$GITHUB_PATH"
+          echo "$HOME/flutter/bin/cache/dart-sdk/bin" >> "$GITHUB_PATH"
+
+      - name: Verify Flutter and Xcode
+        shell: bash
+        run: |
+          set -euo pipefail
+          flutter --version
+          xcodebuild -version
+          flutter config --no-analytics
+
+      - name: Prepare Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustc --version
+          cargo --version
+          rustup target add aarch64-apple-ios
+
+      - name: Install CocoaPods if needed
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v pod >/dev/null 2>&1; then
+            sudo gem install cocoapods
+          fi
+          pod --version
+
+      - name: Get Flutter dependencies
+        working-directory: apps/mobile
+        shell: bash
+        run: |
+          set -euo pipefail
+          flutter pub get
+
+      - name: Build unsigned iOS app
+        working-directory: apps/mobile
+        shell: bash
+        run: |
+          set -euo pipefail
+          flutter build ios --release --no-codesign
+
+      - name: Package unsigned IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APP="apps/mobile/build/ios/iphoneos/Runner.app"
+          if [[ ! -d "$APP" ]]; then
+            echo "::error::Runner.app was not produced."
+            exit 1
+          fi
+
+          OUT="$RUNNER_TEMP/wavelength-ipa"
+          mkdir -p "$OUT/Payload"
+          ditto "$APP" "$OUT/Payload/Runner.app"
+
+          cd "$OUT"
+          /usr/bin/zip -qry Wavelength-unsigned.ipa Payload
+
+          test -s Wavelength-unsigned.ipa
+          echo "IPA_PATH=$OUT/Wavelength-unsigned.ipa" >> "$GITHUB_ENV"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Wavelength-iOS-unsigned
+          path: ${{ env.IPA_PATH }}
+          if-no-files-found: error
+          retention-days: 14
